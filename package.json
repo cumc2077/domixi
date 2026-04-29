@@ -1,21 +1,23 @@
 {
-  "name": "ps4_control",
+  "name": "ps4-control",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Boat tracker and PS4 controller bridge",
+  "private": true,
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "node scripts/build-vercel.js",
+    "dev": "node server.js",
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "express": "^5.2.1",
-    "openssl": "^2.0.0",
-    "package.json": "^0.0.0",
-    "selfsigned": "^5.5.0",
-    "socket.io": "^4.8.3",
     "ws": "^8.19.0"
   }
 }

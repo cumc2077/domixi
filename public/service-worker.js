@@ -1,23 +1,53 @@
-const CACHE_NAME = 'boat-gps-v1';
+const CACHE_NAME = 'boat-gps-v2';
 const urlsToCache = [
   '/',
   '/index.html',
-  'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
-  'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+  '/manifest.json',
+  '/icon-192.png',
+  '/icon-512.png'
 ];
 
-// Cài đặt Service Worker
-self.addEventListener('install', event => {
+self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache))
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(urlsToCache))
+      .then(() => self.skipWaiting())
   );
 });
 
-// Phản hồi các yêu cầu từ Cache
-self.addEventListener('fetch', event => {
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys
+        .filter((key) => key !== CACHE_NAME)
+        .map((key) => caches.delete(key))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
+
+  const url = new URL(event.request.url);
+
+  if (url.origin !== self.location.origin) {
+    event.respondWith(fetch(event.request));
+    return;
+  }
+
+  if (url.pathname === '/runtime-config.js') {
+    event.respondWith(fetch(event.request));
+    return;
+  }
+
   event.respondWith(
-    caches.match(event.request).then(response => {
-      return response || fetch(event.request);
+    caches.match(event.request).then((response) => {
+      return response || fetch(event.request).then((fetchResponse) => {
+        return caches.open(CACHE_NAME).then((cache) => {
+          cache.put(event.request, fetchResponse.clone());
+          return fetchResponse;
+        });
+      });
     })
   );
 });
