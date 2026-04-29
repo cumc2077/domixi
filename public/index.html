@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#00ff00">
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/service-worker.js')
+                .then(reg => console.log('Service Worker đã sẵn sàng!', reg))
+                .catch(err => console.log('Lỗi đăng ký Service Worker:', err));
+        });
+        }
+    </script>
+    <title>PS4 GPS Boat Tracker</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Courier New', monospace; }
+        body {
+            background: #121212;
+            color: #00ff00;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .header {
+            text-align: center;
+            padding: 5px;
+            background: #1a1a1a;
+            border-bottom: 2px solid #333;
+            z-index: 1000;
+        }
+        .header h2 { font-size: 16px; margin: 0; }
+        .status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            border: 1px solid #333;
+            margin-top: 5px;
+        }
+        .status.connected { border-color: #00ff00; background: rgba(0, 255, 0, 0.1); }
+        .status.disconnected { border-color: #ff0000; color: #ff0000; background: rgba(255, 0, 0, 0.1); }
+
+        /* Dashboard Stats */
+        .dashboard {
+            display: flex;
+            justify-content: space-around;
+            padding: 5px;
+            background: #0a0a0a;
+            border-bottom: 2px solid #333;
+            z-index: 1000;
+        }
+        .stat-box {
+            text-align: center;
+            background: #1a1a1a;
+            padding: 5px;
+            border-radius: 5px;
+            border: 1px solid #333;
+            flex: 1;
+            margin: 0 3px;
+        }
+        .stat-label { color: #888; font-size: 10px; margin-bottom: 3px; }
+        .stat-value { font-size: 14px; font-weight: bold; color: #fff; }
+        .stat-value.highlight { color: #00ff00; }
+
+        /* Map Container */
+        #map {
+            flex: 1;
+            width: 100%;
+            background: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>🚤 BOAT TRACKER & CONTROL</h2>
+        <div class="status disconnected" id="stat">Đang đợi kết nối...</div>
+    </div>
+
+    <div class="dashboard">
+        <div class="stat-box">
+            <div class="stat-label">SPEED</div>
+            <div class="stat-value highlight" id="speed-val">0.0 km/h</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">DISTANCE</div>
+            <div class="stat-value highlight" id="dist-val">0 m</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">STEERING (Lx)</div>
+            <div class="stat-value" id="lx-val">0</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-label">THROTTLE (R2)</div>
+            <div class="stat-value" id="r2-val">0</div>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // ========== MAP INITIALIZATION ==========
+        // Mặc định ở Việt Nam, sẽ tự update khi có GPS
+        const map = L.map('map').setView([16.0, 106.0], 6);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // Icon cho Thuyền (Đỏ) và Bộ điều khiển (Xanh)
+        const boatIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+            iconSize: [25, 41], iconAnchor: [12, 41]
+        });
+        const clientIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
+            iconSize: [25, 41], iconAnchor: [12, 41]
+        });
+
+        let boatMarker = L.marker([0, 0], {icon: boatIcon}).addTo(map).bindPopup("🚤 Thuyền ESP32");
+        let clientMarker = L.marker([0, 0], {icon: clientIcon}).addTo(map).bindPopup("📱 Bộ điều khiển");
+
+        let mapCentered = false;
+
+        // ========== TOÁN HỌC (HAVERSINE) ==========
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371e3; // Bán kính Trái Đất (mét)
+            const p1 = lat1 * Math.PI/180;
+            const p2 = lat2 * Math.PI/180;
+            const dp = (lat2-lat1) * Math.PI/180;
+            const dl = (lon2-lon1) * Math.PI/180;
+            const a = Math.sin(dp/2) * Math.sin(dp/2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl/2) * Math.sin(dl/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        // ========== GPS BỘ ĐIỀU KHIỂN (CLIENT) ==========
+        let clientPos = null;
+        if ("geolocation" in navigator) {
+            navigator.geolocation.watchPosition((position) => {
+                clientPos = { lat: position.coords.latitude, lon: position.coords.longitude };
+                clientMarker.setLatLng([clientPos.lat, clientPos.lon]);
+                if (!mapCentered) {
+                    map.setView([clientPos.lat, clientPos.lon], 16);
+                    mapCentered = true;
+                }
+            }, (err) => console.log("Lỗi lấy GPS client: ", err),
+            { enableHighAccuracy: true });
+        }
+
+        // ========== XỬ LÝ DỮ LIỆU THUYỀN (ESP32) ==========
+        let lastBoatPos = null;
+        let lastBoatTime = 0;
+
+        function updateBoatData(lat, lon) {
+            const now = Date.now();
+            boatMarker.setLatLng([lat, lon]);
+
+            // Tính khoảng cách
+            if (clientPos) {
+                const dist = getDistance(clientPos.lat, clientPos.lon, lat, lon);
+                document.getElementById('dist-val').innerText = Math.round(dist) + ' m';
+            }
+
+            // Tính tốc độ
+            if (lastBoatPos && lastBoatTime) {
+                const timeDiff = (now - lastBoatTime) / 1000; // Giây
+                if (timeDiff > 0) {
+                    const moveDist = getDistance(lastBoatPos.lat, lastBoatPos.lon, lat, lon);
+                    const speedKmH = (moveDist / timeDiff) * 3.6;
+                    // Bỏ qua nhiễu sóng GPS (nếu tốc độ > 100km/h thường là nhiễu)
+                    if(speedKmH < 100) {
+                        document.getElementById('speed-val').innerText = speedKmH.toFixed(1) + ' km/h';
+                    }
+                }
+            }
+
+            lastBoatPos = { lat, lon };
+            lastBoatTime = now;
+
+            // Vẽ đường thẳng nối tay cầm và thuyền
+            // L.polyline([[clientPos.lat, clientPos.lon], [lat, lon]], {color: 'green'}).addTo(map);
+        }
+
+        // ========== WEBSOCKET & GAMEPAD ==========
+        const statusEl = document.getElementById('stat');
+        let socket = null;
+        let gamepadIndex = null;
+        let currentData = { lx: 0, r2: 0 };
+        let sendInterval = null;
+
+        function connect() {
+            socket = new WebSocket('wss://' + window.location.host);
+
+            socket.onopen = () => {
+                statusEl.className = 'status connected';
+                statusEl.innerText = '🌐 Đã kết nối Server';
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    // Nếu nhận được tọa độ từ ESP32
+                    if (data.lat !== undefined && data.lon !== undefined) {
+                        updateBoatData(data.lat, data.lon);
+                    }
+                } catch (e) {}
+            };
+
+            socket.onclose = () => {
+                statusEl.className = 'status disconnected';
+                statusEl.innerText = '❌ Mất kết nối, đang thử lại...';
+                setTimeout(connect, 2000);
+            };
+        }
+
+        // Xử lý tay cầm PS4
+        function applyDeadzone(value) {
+            return Math.abs(value) < 0.1 ? 0 : Math.round(value * 100);
+        }
+
+        window.addEventListener("gamepadconnected", (e) => {
+            gamepadIndex = e.gamepad.index;
+            statusEl.innerText = '🎮 PS4 Đã kết nối!';
+            if (!sendInterval) {
+                sendInterval = setInterval(sendData, 50); // Gửi 20Hz
+            }
+        });
+
+        window.addEventListener("gamepaddisconnected", () => {
+            gamepadIndex = null;
+            clearInterval(sendInterval);
+            sendInterval = null;
+            statusEl.innerText = '⚠️ Mất tín hiệu PS4';
+        });
+
+        function sendData() {
+            if (gamepadIndex !== null) {
+                const gp = navigator.getGamepads()[gamepadIndex];
+                if (gp) {
+                    currentData.lx = applyDeadzone(gp.axes[0]);
+                    currentData.r2 = Math.round(gp.buttons[7].value * 100);
+
+                    // Hiển thị lên màn hình
+                    document.getElementById('lx-val').innerText = currentData.lx;
+                    document.getElementById('r2-val').innerText = currentData.r2;
+
+                    // Gửi đi
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify(currentData));
+                    }
+                }
+            }
+        }
+
+        // Bắt đầu
+        connect();
+    </script>
+</body>
+</html>
