@@ -10,6 +10,9 @@ const app = express();
 const HOST = process.env.HOST || '0.0.0.0';
 const WEB_PORT = Number(process.env.PORT || 3000);
 const ESP_PORT = Number(process.env.ESP_PORT || 3001);
+const IS_RENDER = process.env.RENDER === 'true';
+const USE_LEGACY_ESP_PORT = process.env.SINGLE_PORT !== '1' && !IS_RENDER && ESP_PORT !== WEB_PORT;
+const ESP_PATHS = new Set(['/esp32', '/esp', '/device']);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CERT_FILE = path.join(__dirname, 'cert.pem');
 const KEY_FILE = path.join(__dirname, 'key.pem');
@@ -24,7 +27,9 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     webClients: webClients.size,
-    espClients: espClients.size
+    espClients: espClients.size,
+    espPath: '/esp32',
+    legacyEspPort: USE_LEGACY_ESP_PORT ? ESP_PORT : null
   });
 });
 
@@ -39,7 +44,7 @@ app.use((req, res, next) => {
 function createWebServer() {
   const hasLocalCert = fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
 
-  if (hasLocalCert && process.env.DISABLE_HTTPS !== '1') {
+  if (hasLocalCert && process.env.DISABLE_HTTPS !== '1' && !IS_RENDER) {
     return {
       protocol: 'https',
       server: https.createServer({
@@ -49,7 +54,10 @@ function createWebServer() {
     };
   }
 
-  console.warn('Local cert.pem/key.pem not found. Falling back to HTTP.');
+  if (!IS_RENDER) {
+    console.warn('Local cert.pem/key.pem not found. Falling back to HTTP.');
+  }
+
   return {
     protocol: 'http',
     server: http.createServer(app)
@@ -120,10 +128,59 @@ function attachHeartbeat(ws, label) {
   ws.on('close', () => clearInterval(heartbeat));
 }
 
+function getUpgradePath(requestUrl) {
+  try {
+    return new URL(requestUrl, 'http://localhost').pathname;
+  } catch (error) {
+    return '/';
+  }
+}
+
+function handleUpgradeWith(server, request, socket, head) {
+  server.handleUpgrade(request, socket, head, (ws) => {
+    server.emit('connection', ws, request);
+  });
+}
+
+function publicHttpUrl() {
+  if (process.env.RENDER_EXTERNAL_HOSTNAME) {
+    return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
+  }
+
+  return `${protocol}://${HOST}:${WEB_PORT}`;
+}
+
+function publicWsUrl(route = '') {
+  if (process.env.RENDER_EXTERNAL_HOSTNAME) {
+    return `wss://${process.env.RENDER_EXTERNAL_HOSTNAME}${route}`;
+  }
+
+  const wsProtocol = protocol === 'https' ? 'wss' : 'ws';
+  return `${wsProtocol}://${HOST}:${WEB_PORT}${route}`;
+}
+
 const { protocol, server: webServer } = createWebServer();
-const webSocketServer = new WebSocket.Server({ server: webServer });
-const espServer = http.createServer();
-const espSocketServer = new WebSocket.Server({ server: espServer });
+const webSocketServer = new WebSocket.Server({ noServer: true });
+const espSocketServer = new WebSocket.Server({ noServer: true });
+let legacyEspServer = null;
+
+webServer.on('upgrade', (request, socket, head) => {
+  const pathName = getUpgradePath(request.url);
+
+  if (ESP_PATHS.has(pathName)) {
+    handleUpgradeWith(espSocketServer, request, socket, head);
+    return;
+  }
+
+  handleUpgradeWith(webSocketServer, request, socket, head);
+});
+
+if (USE_LEGACY_ESP_PORT) {
+  legacyEspServer = http.createServer();
+  legacyEspServer.on('upgrade', (request, socket, head) => {
+    handleUpgradeWith(espSocketServer, request, socket, head);
+  });
+}
 
 webSocketServer.on('connection', (ws, req) => {
   const id = nextClientId++;
@@ -180,14 +237,40 @@ espSocketServer.on('connection', (ws, req) => {
 });
 
 webServer.listen(WEB_PORT, HOST, () => {
-  console.log(`Web app ready at ${protocol}://${HOST}:${WEB_PORT}`);
+  console.log(`Web app ready at ${publicHttpUrl()}`);
+  console.log(`WebSocket for dashboard ready at ${publicWsUrl()}`);
+  console.log(`WebSocket for ESP32 ready at ${publicWsUrl('/esp32')}`);
 });
 
-espServer.listen(ESP_PORT, HOST, () => {
-  console.log(`ESP32 WebSocket bridge ready at ws://${HOST}:${ESP_PORT}`);
-});
+if (legacyEspServer) {
+  legacyEspServer.listen(ESP_PORT, HOST, () => {
+    console.log(`Legacy ESP32 WebSocket bridge ready at ws://${HOST}:${ESP_PORT}`);
+  });
+}
 
-function shutdown() {
+function closeHttpServer(server) {
+  return new Promise((resolve) => {
+    if (!server || !server.listening) {
+      resolve();
+      return;
+    }
+
+    server.close(() => resolve());
+  });
+}
+
+function closeWebSocketServer(server) {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
+let isShuttingDown = false;
+
+async function shutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
   console.log('Shutting down...');
 
   [...webClients.values(), ...espClients.values()].forEach(({ ws }) => {
@@ -196,15 +279,19 @@ function shutdown() {
     }
   });
 
-  webSocketServer.close(() => {
-    espSocketServer.close(() => {
-      webServer.close(() => {
-        espServer.close(() => process.exit(0));
-      });
-    });
-  });
-
   setTimeout(() => process.exit(1), 5000).unref();
+
+  await Promise.all([
+    closeWebSocketServer(webSocketServer),
+    closeWebSocketServer(espSocketServer)
+  ]);
+
+  await Promise.all([
+    closeHttpServer(webServer),
+    closeHttpServer(legacyEspServer)
+  ]);
+
+  process.exit(0);
 }
 
 process.on('SIGINT', shutdown);

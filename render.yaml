@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: domixi-ws
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: SINGLE_PORT
+        value: "1"

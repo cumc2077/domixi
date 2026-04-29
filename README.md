@@ -2,12 +2,34 @@
 
 Static dashboard for Vercel plus a local WebSocket bridge for the ESP32 boat.
 
+## Render WebSocket server
+
+Render runs the long-lived WebSocket server from `server.js`. The repository includes `render.yaml`, so you can create it as a Render Blueprint.
+
+Service settings:
+
+```text
+Name: domixi-ws
+Build command: npm install
+Start command: npm start
+Health check path: /health
+```
+
+Render exposes one public port per web service. Use these public URLs after deploy:
+
+```text
+Dashboard WebSocket: wss://<render-service>.onrender.com
+ESP32 WebSocket:     wss://<render-service>.onrender.com/esp32
+```
+
+The old local ESP32 port `ws://<local-ip>:3001` still works when you run the server outside Render.
+
 ## Vercel deploy
 
 Vercel deploys the `public` folder as the frontend. It does not run the long-lived `server.js` WebSocket bridge, so host that bridge on a server that supports WebSockets and set this Vercel environment variable:
 
 ```text
-BOAT_WS_URL=wss://your-websocket-server.example.com
+BOAT_WS_URL=wss://<render-service>.onrender.com
 ```
 
 Build command:
