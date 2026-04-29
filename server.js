@@ -13,6 +13,7 @@ const ESP_PORT = Number(process.env.ESP_PORT || 3001);
 const IS_RENDER = process.env.RENDER === 'true';
 const USE_LEGACY_ESP_PORT = process.env.SINGLE_PORT !== '1' && !IS_RENDER && ESP_PORT !== WEB_PORT;
 const ESP_PATHS = new Set(['/esp32', '/esp', '/device']);
+const MAX_BUFFERED_BYTES = Number(process.env.MAX_BUFFERED_BYTES || 4096);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CERT_FILE = path.join(__dirname, 'cert.pem');
 const KEY_FILE = path.join(__dirname, 'key.pem');
@@ -66,6 +67,7 @@ function createWebServer() {
 
 function safeSend(ws, payload) {
   if (ws.readyState !== WebSocket.OPEN) return false;
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) return false;
 
   try {
     ws.send(payload);
@@ -88,17 +90,74 @@ function broadcast(clients, payload, exceptWs = null) {
   return sent;
 }
 
-function parseBridgeMessage(message) {
-  const text = message.toString();
+function clampInteger(value, min, max, fallback = 0) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function createControlPacket(lx, r2) {
+  const steering = clampInteger(lx, -100, 100);
+  const throttle = clampInteger(r2, 0, 100);
+  return Buffer.from([steering & 0xff, throttle & 0xff]);
+}
+
+function parseBinaryControl(message) {
+  if (!Buffer.isBuffer(message) || message.length < 2) return null;
+
+  const lx = message.readInt8(0);
+  const r2 = message.readUInt8(1);
+  if (lx < -100 || lx > 100 || r2 > 100) return null;
+
+  return createControlPacket(lx, r2);
+}
+
+function parseCompactControl(text) {
+  const match = /^(-?\d{1,3}),(\d{1,3})$/.exec(text);
+  if (!match) return null;
+
+  return createControlPacket(match[1], match[2]);
+}
+
+function parseBridgeMessage(message, isBinary = false) {
+  if (isBinary) {
+    const controlPayload = parseBinaryControl(message);
+    return controlPayload ? { type: 'control', payload: controlPayload } : null;
+  }
+
+  const text = typeof message === 'string' ? message : message.toString();
+  const compactControl = parseCompactControl(text);
+  if (compactControl) {
+    return { type: 'control', payload: compactControl };
+  }
 
   try {
     const data = JSON.parse(text);
-    const valid = data && typeof data === 'object'
-      && ['lx', 'r2', 'lat', 'lon'].some((key) => Object.prototype.hasOwnProperty.call(data, key));
 
-    return valid ? text : null;
+    if (!data || typeof data !== 'object') return null;
+
+    const hasControl = Object.prototype.hasOwnProperty.call(data, 'lx')
+      || Object.prototype.hasOwnProperty.call(data, 'r2');
+    if (hasControl) {
+      return { type: 'control', payload: createControlPacket(data.lx, data.r2) };
+    }
+
+    const hasTelemetry = Object.prototype.hasOwnProperty.call(data, 'lat')
+      || Object.prototype.hasOwnProperty.call(data, 'lon');
+    return hasTelemetry ? { type: 'telemetry', payload: text } : null;
   } catch (error) {
     return null;
+  }
+}
+
+function tuneSocket(socket) {
+  if (!socket) return;
+
+  try {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 5000);
+  } catch (error) {
+    console.warn('Socket tuning failed:', error.message);
   }
 }
 
@@ -137,6 +196,7 @@ function getUpgradePath(requestUrl) {
 }
 
 function handleUpgradeWith(server, request, socket, head) {
+  tuneSocket(socket);
   server.handleUpgrade(request, socket, head, (ws) => {
     server.emit('connection', ws, request);
   });
@@ -160,8 +220,16 @@ function publicWsUrl(route = '') {
 }
 
 const { protocol, server: webServer } = createWebServer();
-const webSocketServer = new WebSocket.Server({ noServer: true });
-const espSocketServer = new WebSocket.Server({ noServer: true });
+const webSocketServer = new WebSocket.Server({
+  noServer: true,
+  perMessageDeflate: false,
+  maxPayload: 512
+});
+const espSocketServer = new WebSocket.Server({
+  noServer: true,
+  perMessageDeflate: false,
+  maxPayload: 1024
+});
 let legacyEspServer = null;
 
 webServer.on('upgrade', (request, socket, head) => {
@@ -185,21 +253,25 @@ if (USE_LEGACY_ESP_PORT) {
 webSocketServer.on('connection', (ws, req) => {
   const id = nextClientId++;
   const ip = req.socket.remoteAddress;
+  tuneSocket(req.socket);
   webClients.set(id, { ws, ip, connectedAt: new Date() });
   attachHeartbeat(ws, `web client ${id}`);
 
   console.log(`Web client ${id} connected from ${ip}. Active web clients: ${webClients.size}`);
 
-  ws.on('message', (message) => {
-    const payload = parseBridgeMessage(message);
-    if (!payload) {
+  ws.on('message', (message, isBinary) => {
+    const parsed = parseBridgeMessage(message, isBinary);
+    if (!parsed) {
       console.warn(`Web client ${id} sent invalid payload`);
       return;
     }
 
-    const webSent = broadcast(webClients, payload, ws);
-    const espSent = broadcast(espClients, payload);
-    console.log(`Relayed web payload from ${id}: ${webSent} web, ${espSent} ESP32`);
+    if (parsed.type === 'control') {
+      broadcast(espClients, parsed.payload);
+      return;
+    }
+
+    broadcast(webClients, parsed.payload, ws);
   });
 
   ws.on('error', (error) => {
@@ -215,15 +287,15 @@ webSocketServer.on('connection', (ws, req) => {
 espSocketServer.on('connection', (ws, req) => {
   const id = nextClientId++;
   const ip = req.socket.remoteAddress;
+  tuneSocket(req.socket);
   espClients.set(id, { ws, ip, connectedAt: new Date() });
   attachHeartbeat(ws, `ESP32 client ${id}`);
 
   console.log(`ESP32 client ${id} connected from ${ip}. Active ESP32 clients: ${espClients.size}`);
 
-  ws.on('message', (message) => {
-    const payload = message.toString();
-    const webSent = broadcast(webClients, payload);
-    console.log(`Relayed ESP32 payload from ${id}: ${webSent} web`);
+  ws.on('message', (message, isBinary) => {
+    if (isBinary) return;
+    broadcast(webClients, message.toString());
   });
 
   ws.on('error', (error) => {

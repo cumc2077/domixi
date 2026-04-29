@@ -250,11 +250,17 @@
     let reconnectTimer = null;
     let activeSocketUrl = '';
     let gamepadIndex = null;
-    let sendInterval = null;
+    let controlFrameId = null;
+    let lastControlSentAt = 0;
+    let lastSentLx = null;
+    let lastSentR2 = null;
     let clientPos = null;
     let lastBoatPos = null;
     let lastBoatTime = 0;
     let mapCentered = false;
+    const CONTROL_SEND_INTERVAL_MS = 20;
+    const CONTROL_KEEPALIVE_MS = 250;
+    const MAX_SOCKET_BUFFER_BYTES = 64;
     const currentData = { lx: 0, r2: 0 };
 
     const map = L.map('map').setView([16.0, 106.0], 6);
@@ -336,12 +342,16 @@
 
       setStatus(`Connecting to ${activeSocketUrl}...`);
       socket = new WebSocket(activeSocketUrl);
+      socket.binaryType = 'arraybuffer';
 
       socket.onopen = () => {
         setStatus(`Connected to ${activeSocketUrl}`, true);
+        sendCurrentControl(true);
       };
 
       socket.onmessage = (event) => {
+        if (typeof event.data !== 'string') return;
+
         try {
           const data = JSON.parse(event.data);
           if (data.lat !== undefined && data.lon !== undefined) {
@@ -404,21 +414,54 @@
       return Math.abs(value) < 0.1 ? 0 : Math.round(value * 100);
     }
 
-    function sendData() {
-      if (gamepadIndex === null) return;
+    function sendCurrentControl(force = false, now = performance.now()) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      if (!force && socket.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) return;
 
+      const packet = new Int8Array([currentData.lx, currentData.r2]);
+      socket.send(packet);
+      lastControlSentAt = now;
+      lastSentLx = currentData.lx;
+      lastSentR2 = currentData.r2;
+    }
+
+    function updateControlDisplay() {
+      document.getElementById('lx-val').textContent = currentData.lx;
+      document.getElementById('r2-val').textContent = currentData.r2;
+    }
+
+    function pollGamepad(now = performance.now()) {
+      if (gamepadIndex === null) return;
       const gamepad = navigator.getGamepads()[gamepadIndex];
       if (!gamepad) return;
 
       currentData.lx = applyDeadzone(gamepad.axes[0]);
       currentData.r2 = Math.round(gamepad.buttons[7].value * 100);
+      updateControlDisplay();
 
-      document.getElementById('lx-val').textContent = currentData.lx;
-      document.getElementById('r2-val').textContent = currentData.r2;
+      const changed = currentData.lx !== lastSentLx || currentData.r2 !== lastSentR2;
+      const due = now - lastControlSentAt >= CONTROL_SEND_INTERVAL_MS;
+      const keepAliveDue = now - lastControlSentAt >= CONTROL_KEEPALIVE_MS;
 
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(currentData));
+      if (due && (changed || keepAliveDue)) {
+        sendCurrentControl(false, now);
       }
+    }
+
+    function controlLoop(now) {
+      pollGamepad(now);
+      controlFrameId = requestAnimationFrame(controlLoop);
+    }
+
+    function startControlLoop() {
+      if (controlFrameId !== null) return;
+      controlFrameId = requestAnimationFrame(controlLoop);
+    }
+
+    function stopControlLoop() {
+      if (controlFrameId === null) return;
+      cancelAnimationFrame(controlFrameId);
+      controlFrameId = null;
     }
 
     if ('geolocation' in navigator) {
@@ -441,15 +484,16 @@
     window.addEventListener('gamepadconnected', (event) => {
       gamepadIndex = event.gamepad.index;
       setStatus('Gamepad connected.', socket && socket.readyState === WebSocket.OPEN);
-      if (!sendInterval) {
-        sendInterval = setInterval(sendData, 50);
-      }
+      startControlLoop();
     });
 
     window.addEventListener('gamepaddisconnected', () => {
+      currentData.lx = 0;
+      currentData.r2 = 0;
+      updateControlDisplay();
+      sendCurrentControl(true);
       gamepadIndex = null;
-      clearInterval(sendInterval);
-      sendInterval = null;
+      stopControlLoop();
       setStatus('Gamepad disconnected.', socket && socket.readyState === WebSocket.OPEN);
     });
 
